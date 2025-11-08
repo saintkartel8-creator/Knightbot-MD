@@ -82,7 +82,7 @@ async function helpCommand(sock, chatId, message) {
 ║ ➤ .anticall <on/off>
 ║ ➤ .pmblocker <on/off/status>
 ║ ➤ .pmblocker setmsg <text>
-║ ➤ .setmention <reply to msg/media>
+║ ➤ .setmention <reply to msg>
 ║ ➤ .mention <on/off>
 ╚═══════════════════╝
 
@@ -203,9 +203,6 @@ async function helpCommand(sock, chatId, message) {
 
 ╔═══════════════════╗
 🖼️ *ANIME*:
-║ ➤ .neko
-║ ➤ .waifu
-║ ➤ .loli
 ║ ➤ .nom 
 ║ ➤ .poke 
 ║ ➤ .cry 

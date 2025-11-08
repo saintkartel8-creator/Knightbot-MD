@@ -1,12 +1,37 @@
+// 🧹 Fix for ENOSPC / temp overflow in hosted panels
+const fs = require('fs');
+const path = require('path');
+
+// Redirect temp storage away from system /tmp
+const customTemp = path.join(process.cwd(), 'temp');
+if (!fs.existsSync(customTemp)) fs.mkdirSync(customTemp, { recursive: true });
+process.env.TMPDIR = customTemp;
+process.env.TEMP = customTemp;
+process.env.TMP = customTemp;
+
+// Auto-cleaner every 3 hours
+setInterval(() => {
+  fs.readdir(customTemp, (err, files) => {
+    if (err) return;
+    for (const file of files) {
+      const filePath = path.join(customTemp, file);
+      fs.stat(filePath, (err, stats) => {
+        if (!err && Date.now() - stats.mtimeMs > 3 * 60 * 60 * 1000) {
+          fs.unlink(filePath, () => {});
+        }
+      });
+    }
+  });
+  console.log('🧹 Temp folder auto-cleaned');
+}, 3 * 60 * 60 * 1000);
+
 const settings = require('./settings');
 require('./config.js');
 const { isBanned } = require('./lib/isBanned');
 const yts = require('yt-search');
 const { fetchBuffer } = require('./lib/myfunc');
-const fs = require('fs');
 const fetch = require('node-fetch');
 const ytdl = require('ytdl-core');
-const path = require('path');
 const axios = require('axios');
 const ffmpeg = require('fluent-ffmpeg');
 const { isSudo } = require('./lib/index');
@@ -182,17 +207,16 @@ async function handleMessages(sock, messageUpdate, printLog) {
         if (userMessage.startsWith('.')) {
             console.log(`📝 Command used in ${isGroup ? 'group' : 'private'}: ${userMessage}`);
         }
-        // Enforce private mode BEFORE any replies (except owner/sudo)
+        // Read bot mode once; don't early-return so moderation can still run in private mode
+        let isPublic = true;
         try {
             const data = JSON.parse(fs.readFileSync('./data/messageCount.json'));
-            // Allow owner/sudo to use bot even in private mode
-            if (!data.isPublic && !message.key.fromMe && !senderIsSudo) {
-                return; // Silently ignore messages from non-owners when in private mode
-            }
+            if (typeof data.isPublic === 'boolean') isPublic = data.isPublic;
         } catch (error) {
             console.error('Error checking access mode:', error);
-            // Default to public mode if there's an error reading the file
+            // default isPublic=true on error
         }
+        const isOwnerOrSudo = message.key.fromMe || senderIsSudo;
         // Check if user is banned (skip ban check for unban command)
         if (isBanned(senderId) && !userMessage.startsWith('.unban')) {
             // Only respond occasionally to avoid spam
@@ -222,10 +246,13 @@ async function handleMessages(sock, messageUpdate, printLog) {
 
         if (!message.key.fromMe) incrementMessageCount(chatId, senderId);
 
-        // Check for bad words FIRST, before ANY other processing
-        if (isGroup && userMessage) {
-            await handleBadwordDetection(sock, chatId, message, userMessage, senderId);
-            
+        // Check for bad words and antilink FIRST, before ANY other processing
+        // Always run moderation in groups, regardless of mode
+        if (isGroup) {
+            if (userMessage) {
+                await handleBadwordDetection(sock, chatId, message, userMessage, senderId);
+            }
+            // Antilink checks message text internally, so run it even if userMessage is empty
             await Antilink(message, sock);
         }
 
@@ -249,11 +276,19 @@ async function handleMessages(sock, messageUpdate, printLog) {
             await handleAutotypingForMessage(sock, chatId, userMessage);
 
             if (isGroup) {
-                // Process non-command messages first
-                await handleChatbotResponse(sock, chatId, message, userMessage, senderId);
+                // Always run moderation features (antitag) regardless of mode
                 await handleTagDetection(sock, chatId, message, senderId);
                 await handleMentionDetection(sock, chatId, message);
+                
+                // Only run chatbot in public mode or for owner/sudo
+                if (isPublic || isOwnerOrSudo) {
+                    await handleChatbotResponse(sock, chatId, message, userMessage, senderId);
+                }
             }
+            return;
+        }
+        // In private mode, only owner/sudo can run commands
+        if (!isPublic && !isOwnerOrSudo) {
             return;
         }
 
@@ -340,9 +375,21 @@ async function handleMessages(sock, messageUpdate, printLog) {
                 await unmuteCommand(sock, chatId, senderId);
                 break;
             case userMessage.startsWith('.ban'):
+                if (!isGroup) {
+                    if (!message.key.fromMe && !senderIsSudo) {
+                        await sock.sendMessage(chatId, { text: 'Only owner/sudo can use .ban in private chat.' }, { quoted: message });
+                        break;
+                    }
+                }
                 await banCommand(sock, chatId, message);
                 break;
             case userMessage.startsWith('.unban'):
+                if (!isGroup) {
+                    if (!message.key.fromMe && !senderIsSudo) {
+                        await sock.sendMessage(chatId, { text: 'Only owner/sudo can use .unban in private chat.' }, { quoted: message });
+                        break;
+                    }
+                }
                 await unbanCommand(sock, chatId, message);
                 break;
             case userMessage === '.help' || userMessage === '.menu' || userMessage === '.bot' || userMessage === '.list':
@@ -448,12 +495,8 @@ async function handleMessages(sock, messageUpdate, printLog) {
             case userMessage === '.owner':
                 await ownerCommand(sock, chatId);
                 break;
-            case userMessage === '.tagall':
-                if (isSenderAdmin || message.key.fromMe) {
-                    await tagAllCommand(sock, chatId, senderId, message);
-                } else {
-                    await sock.sendMessage(chatId, { text: 'Sorry, only group admins can use the .tagall command.', ...channelInfo }, { quoted: message });
-                }
+             case userMessage === '.tagall':
+                await tagAllCommand(sock, chatId, senderId, message);
                 break;
             case userMessage === '.tagnotadmin':
                 await tagNotAdminCommand(sock, chatId, senderId, message);
@@ -703,9 +746,13 @@ async function handleMessages(sock, messageUpdate, printLog) {
                 const match = userMessage.slice(8).trim();
                 await handleChatbotCommand(sock, chatId, message, match);
                 break;
-            case userMessage.startsWith('.take'):
-                const takeArgs = rawText.slice(5).trim().split(' ');
-                await takeCommand(sock, chatId, message, takeArgs);
+            case userMessage.startsWith('.take') || userMessage.startsWith('.steal'):
+                {
+                    const isSteal = userMessage.startsWith('.steal');
+                    const sliceLen = isSteal ? 6 : 5; // '.steal' vs '.take'
+                    const takeArgs = rawText.slice(sliceLen).trim().split(' ');
+                    await takeCommand(sock, chatId, message, takeArgs);
+                }
                 break;
             case userMessage === '.flirt':
                 await flirtCommand(sock, chatId, message);
